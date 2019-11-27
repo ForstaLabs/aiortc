@@ -48,28 +48,6 @@ from .utils import uint16_add, uint16_gt
 logger = logging.getLogger("rtp")
 
 
-def decoder_worker(loop, input_q, output_q):
-    codec_name = None
-    decoder = None
-
-    while True:
-        task = input_q.get()
-        if task is None:
-            # inform the track that is has ended
-            asyncio.run_coroutine_threadsafe(output_q.put(None), loop)
-            break
-        codec, encoded_frame = task
-
-        if codec.name != codec_name:
-            decoder = get_decoder(codec)
-            codec_name = codec.name
-
-        for frame in decoder.decode(encoded_frame):
-            # pass the decoded frame to the track
-            asyncio.run_coroutine_threadsafe(output_q.put(frame), loop)
-
-    if decoder is not None:
-        del decoder
 
 
 class NackGenerator:
@@ -170,7 +148,7 @@ class RemoteStreamTrack(MediaStreamTrack):
     def __init__(self, kind: str) -> None:
         super().__init__()
         self.kind = kind
-        self._queue = asyncio.Queue()  # type: asyncio.Queue
+        self._queue = asyncio.Queue(maxsize=1000)  # type: asyncio.Queue
 
     async def recv(self) -> Frame:
         """
@@ -244,7 +222,7 @@ class RTCRtpReceiver:
 
         self.__active_ssrc = {}  # type: Dict[int, datetime.datetime]
         self.__codecs = {}  # type: Dict[int, RTCRtpCodecParameters]
-        self.__decoder_queue = queue.Queue()  # type: queue.Queue
+        self.__decoder_queue = queue.Queue(maxsize=1000)  # type: queue.Queue
         self.__decoder_thread = None  # type: Optional[threading.Thread]
         self.__kind = kind
         if kind == "audio":
@@ -260,6 +238,7 @@ class RTCRtpReceiver:
         self.__rtcp_task = None  # type: Optional[asyncio.Future[None]]
         self.__rtx_ssrc = {}  # type: Dict[int, int]
         self.__started = False
+        self.__stopping = False
         self.__stats = RTCStatsReport()
         self.__timestamp_mapper = TimestampMapper()
         self.__transport = transport
@@ -342,19 +321,7 @@ class RTCRtpReceiver:
             for encoding in parameters.encodings:
                 if encoding.rtx:
                     self.__rtx_ssrc[encoding.rtx.ssrc] = encoding.ssrc
-
-            # start decoder thread
-            self.__decoder_thread = threading.Thread(
-                target=decoder_worker,
-                name=self.__kind + "-decoder",
-                args=(
-                    asyncio.get_event_loop(),
-                    self.__decoder_queue,
-                    self._track._queue,
-                ),
-            )
-            self.__decoder_thread.start()
-
+            self.__start_decoder()
             self.__transport._register_rtp_receiver(self, parameters)
             self.__rtcp_task = asyncio.ensure_future(self._run_rtcp())
             self.__started = True
@@ -367,13 +334,14 @@ class RTCRtpReceiver:
         Irreversibly stop the receiver.
         """
         if self.__started:
+            self.__stopping = True
             self.__transport._unregister_rtp_receiver(self)
-            self.__stop_decoder()
+            await self.__stop_decoder()
             self.__rtcp_task.cancel()
             await self.__rtcp_exited.wait()
 
-    def _handle_disconnect(self) -> None:
-        self.__stop_decoder()
+    async def _handle_disconnect(self) -> None:
+        await self.__stop_decoder()
 
     async def _handle_rtcp_packet(self, packet: AnyRtcpPacket) -> None:
         self.__log_debug("< %s", packet)
@@ -403,7 +371,7 @@ class RTCRtpReceiver:
             ) & 0xFFFFFFFF
             self.__lsr_time[packet.ssrc] = time.time()
         elif isinstance(packet, RtcpByePacket):
-            self.__stop_decoder()
+            await self.__stop_decoder()
 
     async def _handle_rtp_packet(self, packet: RtpPacket, arrival_time_ms: int) -> None:
         """
@@ -436,7 +404,7 @@ class RTCRtpReceiver:
         # check the codec is known
         codec = self.__codecs.get(packet.payload_type)
         if codec is None:
-            self.__log_debug(
+            self.__log_warning(
                 "x RTP packet with unknown payload type %d", packet.payload_type
             )
             return
@@ -450,7 +418,7 @@ class RTCRtpReceiver:
         if is_rtx(codec):
             original_ssrc = self.__rtx_ssrc.get(packet.ssrc)
             if original_ssrc is None:
-                self.__log_debug("x RTX packet from unknown SSRC %d", packet.ssrc)
+                self.__log_warning("x RTX packet from unknown SSRC %d", packet.ssrc)
                 return
 
             if len(packet.payload) < 2:
@@ -474,18 +442,28 @@ class RTCRtpReceiver:
             else:
                 packet._data = b""
         except ValueError as exc:
-            self.__log_debug("x RTP payload parsing failed: %s", exc)
+            self.__log_warning("x RTP payload parsing failed: %s", exc)
             return
 
         # try to re-assemble encoded frame
         encoded_frame = self.__jitter_buffer.add(packet)
 
         # if we have a complete encoded frame, decode it
-        if encoded_frame is not None and self.__decoder_thread:
+        if encoded_frame is not None:
+            if self.__stopping:
+                # XXX Might want to do this much earlier
+                self.__log_warning("stopped: dropping frame")
+                return
+            if not self.__decoder_thread:
+                self.__log_info("restarting the decoder thread")
+                self.__start_decoder()
             encoded_frame.timestamp = self.__timestamp_mapper.map(
                 encoded_frame.timestamp
             )
-            self.__decoder_queue.put((codec, encoded_frame))
+            try:
+                self.__decoder_queue.put_nowait((codec, encoded_frame))
+            except queue.Full:
+                self.__log_error("decoder queue full: dropping frame")
 
     async def _run_rtcp(self) -> None:
         self.__log_debug("- RTCP started")
@@ -526,7 +504,7 @@ class RTCRtpReceiver:
         except asyncio.CancelledError:
             pass
 
-        self.__log_debug("- RTCP finished")
+        self.__log_info("- RTCP finished")
         self.__rtcp_exited.set()
 
     async def _send_rtcp(self, packet) -> None:
@@ -560,14 +538,87 @@ class RTCRtpReceiver:
     def _set_rtcp_ssrc(self, ssrc: int) -> None:
         self.__rtcp_ssrc = ssrc
 
-    def __stop_decoder(self) -> None:
+    def __start_decoder(self) -> None:
         """
-        Stop the decoder thread, which will in turn stop the track.
+        Start the decoder thread.
+        """
+        assert self.__decoder_thread is None
+        self.__decoder_thread = threading.Thread(
+            target=self.__decoder_worker,
+            name=self.__kind + "-decoder",
+            args=(asyncio.get_event_loop(),)
+        )
+        self.__log_info("starting decoder thread: %s", self.__decoder_thread)
+        self.__decoder_thread.start()
+
+    async def __stop_decoder(self) -> None:
+        """
+        Stop the decoder thread.
         """
         if self.__decoder_thread:
-            self.__decoder_queue.put(None)
-            self.__decoder_thread.join()
+            self.__log_info("stopping decoder thread: %s", self.__decoder_thread)
+            try:
+                self.__decoder_queue.put_nowait(None)
+            except queue.Full:
+                self.__decoder_queue.get_nowait()
+                self.__decoder_queue.put_nowait(None)
+            t = self.__decoder_thread
             self.__decoder_thread = None
+            await asyncio.get_event_loop().run_in_executor(None, t.join)
+
+    def __decoder_worker(self, loop):
+        codec_name = None
+        decoder = None
+        input_q = self.__decoder_queue
+        output_q = self._track._queue
+
+        def put_output(frame):
+            """ Callback that runs in asyncio's thread. """
+            try:
+                output_q.put_nowait(frame)
+            except asyncio.Full:
+                self.__log_error(
+                    "track queue is full: rotating queue (framedrop)"
+                )
+                output_q.get_nowait()
+                output_q.put_nowait(frame)
+
+        while True:
+            task = input_q.get()
+            if task is None:
+                if self.__stopping:
+                    # inform the track that is has ended
+                    loop.call_soon_threadsafe(put_output, None)
+                    #asyncio.run_coroutine_threadsafe(output_q.put(None), loop)
+                break
+            codec, encoded_frame = task
+
+            if codec.name != codec_name:
+                decoder = get_decoder(codec)
+                codec_name = codec.name
+
+            for frame in decoder.decode(encoded_frame):
+                # pass the decoded frame to the track
+                loop.call_soon_threadsafe(put_output, frame)
+                #asyncio.run_coroutine_threadsafe(output_q.put(frame), loop)
+
+        if decoder is not None:
+            del decoder
+
+    def __log(self, level: int, msg: str, *args) -> None:
+        logger.log(level, "receiver(%s) " + msg, self.__kind, *args)
+
+    def __log_critical(self, msg: str, *args) -> None:
+        self.__log(logging.CRITICAL, msg, *args)
+
+    def __log_error(self, msg: str, *args) -> None:
+        self.__log(logging.ERROR, msg, *args)
+
+    def __log_warning(self, msg: str, *args) -> None:
+        self.__log(logging.WARNING, msg, *args)
+
+    def __log_info(self, msg: str, *args) -> None:
+        self.__log(logging.INFO, msg, *args)
 
     def __log_debug(self, msg: str, *args) -> None:
-        logger.debug("receiver(%s) " + msg, self.__kind, *args)
+        self.__log(logging.DEBUG, msg, *args)
