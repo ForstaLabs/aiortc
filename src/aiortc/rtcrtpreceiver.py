@@ -576,7 +576,7 @@ class RTCRtpReceiver:
             """ Callback that runs in asyncio's thread. """
             try:
                 output_q.put_nowait(frame)
-            except asyncio.Full:
+            except asyncio.QueueFull:
                 self.__log_error(
                     "track queue is full: rotating queue (framedrop)"
                 )
